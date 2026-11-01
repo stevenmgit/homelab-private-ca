@@ -22,11 +22,12 @@ Build a private two-tier certificate authority in a Proxmox LXC container, issue
 10. [Part 8 – Central reverse proxy (Caddy)](#part-8--central-reverse-proxy-caddy)
 11. [Part 9 – Move apps behind the proxy](#part-9--move-apps-behind-the-proxy)
 12. [Part 10 – Apps that already serve HTTPS (Nessus example)](#part-10--apps-that-already-serve-https-nessus-example)
-13. [Adding a new app (checklist)](#adding-a-new-app-checklist)
-14. [Troubleshooting and lessons learned](#troubleshooting-and-lessons-learned)
-15. [Maintenance](#maintenance)
-16. [Security notes and trade-offs](#security-notes-and-trade-offs)
-17. [References](#references)
+13. [Part 11 – Lock app containers to the proxy](#part-11--lock-app-containers-to-the-proxy)
+14. [Adding a new app (checklist)](#adding-a-new-app-checklist)
+15. [Troubleshooting and lessons learned](#troubleshooting-and-lessons-learned)
+16. [Maintenance](#maintenance)
+17. [Security notes and trade-offs](#security-notes-and-trade-offs)
+18. [References](#references)
 
 ---
 
@@ -625,6 +626,116 @@ Users now open `https://nessus.home.arpa` (no `:8834`).
 
 ---
 
+## Part 11 – Lock app containers to the proxy
+
+After Parts 9–10, each app still answers on its own IP and port (for example `http://APP1_IP:22300`), which bypasses the proxy, HTTPS and any proxy-level login. This part makes each app container accept connections **only from `PROXY_IP`, only on its app port**, and drop everything else that comes in, including SSH. Admin access is through the Proxmox console, or `pct enter <VMID>` from the host shell, neither of which uses the network.
+
+The firewall runs **inside each app container** with `nftables`. The Proxmox host and the Datacenter firewall are not touched.
+
+| Container | App port allowed from `PROXY_IP` |
+|---|---|
+| Joplin (`APP1_IP`) | TCP 22300 |
+| Immich (`APP2_IP`) | TCP 2283 |
+| Nessus (`APP3_IP`) | TCP 8834 |
+
+**Don't apply this to the CA, the proxy or the Proxmox host.** Every client needs to reach the CA and the proxy, and the CA's http-01 check connects to the proxy and the Proxmox host on port 80.
+
+No app container needs incoming connections from the CA. Certificate renewal is always initiated by the client (Caddy on the proxy; `step ca renew` in the Nessus container), and the CA's replies are allowed by the `established,related` rule.
+
+### 11.1 Rules (one container at a time, from its Proxmox console)
+
+```bash
+apt install -y nftables
+cat << 'EOF' > /etc/nftables.conf
+#!/usr/sbin/nft -f
+flush ruleset
+
+define PROXY = PROXY_IP
+define APP_PORT = 22300
+
+table inet filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+        meta l4proto ipv6-icmp accept
+        icmp type echo-request accept
+        udp sport 67 udp dport 68 accept
+        ip saddr $PROXY tcp dport $APP_PORT accept
+    }
+}
+EOF
+```
+
+Replace `PROXY_IP` with the proxy's address and set `APP_PORT` to the container's port. What the rules allow:
+- `lo`: the container talking to itself, e.g. the app reaching its local database.
+- `established,related`: replies to connections the container started (updates, Nessus scans, certificate renewal).
+- `ipv6-icmp` and UDP 67→68: IPv6 neighbor discovery and DHCP renewals, so the container keeps its address.
+- `echo-request`: ping, for troubleshooting. Remove the line if you don't want it.
+- The last line: the proxy reaching the app.
+
+### 11.2 Load it
+
+```bash
+nft -c -f /etc/nftables.conf && systemctl enable nftables && systemctl restart nftables
+nft list ruleset | grep -E 'policy|dport'          # expect "policy drop" and the app port
+```
+
+> Use `restart`, not `enable --now`. On Debian 13 the `nftables` service may already be running with Debian's default (accept-all) ruleset, and `enable --now` doesn't reload a service that's already active, so the new file is silently ignored.
+
+`nftables` worked inside unprivileged Debian 13 LXC containers on Proxmox VE 9 in this build. If `nft list ruleset` returns "Operation not permitted" on your setup, stop here.
+
+### 11.3 Verify
+
+From the **proxy** (allowed):
+
+```bash
+curl -sI http://APP1_IP:22300 | head -1             # expect an HTTP status line
+```
+
+From **another machine**, such as the CA container (blocked):
+
+```bash
+curl -m 5 -s -o /dev/null http://APP1_IP:22300; echo "curl exit code: $?"   # expect 28 (timeout)
+```
+
+> Don't pipe `curl` into `head` for this test. `$?` would then report `head`'s exit code (0), not `curl`'s.
+
+Also check:
+- The app still works at `https://app.home.arpa`, including logging in and its mobile or desktop clients.
+- `apt update` works inside the container (outgoing traffic).
+- After rebooting the container, `nft list ruleset | grep policy` still shows `policy drop`.
+- **Nessus:** `step ca health` prints `ok`, `systemctl is-active nessus-cert-renew` prints `active`, and a test scan returns results.
+
+Quick check of all containers at once, from the CA container (every line should end in `28`):
+
+```bash
+for t in http://APP1_IP:22300 http://APP2_IP:2283 https://APP3_IP:8834; do curl -m 5 -sk -o /dev/null $t; echo "$t → $?"; done
+```
+
+And from the proxy (every line should show a status code, not `000`):
+
+```bash
+for h in joplin immich nessus; do echo "$h → $(curl -s -o /dev/null -w '%{http_code}' https://$h.home.arpa)"; done
+```
+
+### 11.4 Undo
+
+From the container's console:
+
+```bash
+systemctl disable --now nftables && nft flush ruleset
+```
+
+### 11.5 Notes
+
+- **Trade-off:** root inside a container can switch this firewall off. The Proxmox firewall (per-container rules enforced on the host) avoids that, but requires enabling the Datacenter firewall, which also starts filtering traffic to the Proxmox host itself.
+- **Anything else that connects to these containers by IP** (monitoring, backups over the network, SSH) is now blocked. Add a rule for it if needed.
+- **Forgotten container root password:** from the Proxmox host shell, `pct enter <VMID>` opens a root shell without it; then run `passwd`.
+
+---
+
 ## Adding a new app (checklist)
 
 1. **Container:** fixed IP in UniFi, **no** Local DNS Record.
@@ -644,6 +755,7 @@ Users now open `https://nessus.home.arpa` (no `:8834`).
 6. **Confirm:** `journalctl -u caddy --no-pager -n 20 | grep -i newapp` → "certificate obtained successfully".
 7. **App settings:** if the app has a "base URL", "external URL" or "domain" setting, set it to `https://newapp.home.arpa`.
 8. **Rollback:** `cp /etc/caddy/Caddyfile.bak /etc/caddy/Caddyfile && systemctl reload caddy`
+9. **Lock it down:** in the new app's container, apply [Part 11](#part-11--lock-app-containers-to-the-proxy) with its port, and confirm direct access by IP times out.
 
 Apps that serve their own HTTPS need a block like [10.6](#106-proxy-block-with-full-upstream-verification), not the simple one.
 
@@ -661,6 +773,8 @@ Apps that serve their own HTTPS need a block like [10.6](#106-proxy-block-with-f
 | Phone app "Server is not reachable" | Test the same URL in the phone's browser first: DNS error → Private DNS / resolver; certificate warning → CA not installed; padlock → app-specific trust. |
 | `nessuscli import-certs`: "could not be validated with the new CA certificate" | Pass a bundle of **intermediate + root** as `--cacert`. |
 | Caddy can't verify an HTTPS backend | The backend certificate may lack a SAN (CN-only). Issue it a proper certificate from the CA. |
+| New `nftables.conf` written, but `nft list ruleset` still shows `policy accept` | The service was already running with Debian's default rules. Run `systemctl restart nftables`. |
+| Firewall test prints `exit code: 0` but no HTTP line | `$?` came from `head`, not `curl`. Rerun without the pipe; `28` means blocked. |
 
 **Avoid leaking secrets while debugging:**
 - `diff` prints differing lines, so a failed comparison against a key file prints the key. Add `> /dev/null`.
@@ -683,6 +797,7 @@ Apps that serve their own HTTPS need a block like [10.6](#106-proxy-block-with-f
   systemctl status caddy --no-pager | head -3      # proxy
   pvenode cert info                                # Proxmox host
   systemctl status nessus-cert-renew --no-pager    # Nessus container
+  nft list ruleset | grep policy                   # each app container → policy drop
   ```
 
 ---
@@ -691,7 +806,7 @@ Apps that serve their own HTTPS need a block like [10.6](#106-proxy-block-with-f
 
 - **ACME trusts DNS and the network.** Anyone who can make a name resolve to a machine they control, and answer on port 80, can obtain a certificate for that name. Protect UniFi DNS and admin access. step-ca supports [policies](https://smallstep.com/docs/step-ca/policies/) to restrict which names ACME may issue for.
 - **The root CA is trusted everywhere it's installed.** Anyone with the root key and password could impersonate any website to those devices. Keep both offline and stored separately.
-- **Apps still listen on their own IPs.** After the switch, apps remain reachable over plain HTTP at `APP_IP:PORT`. Consider firewalling them so that only `PROXY_IP` can connect.
+- **Apps listen on their own IPs.** Without [Part 11](#part-11--lock-app-containers-to-the-proxy), apps remain reachable over plain HTTP at `APP_IP:PORT`, bypassing the proxy. Part 11 restricts each app port to `PROXY_IP`.
 - **Mobile "allow self-signed certificates" toggles** make an app accept *any* certificate. Prefer installing the root CA and leaving such toggles off.
 - **Creating the root in the container (Part 3)** is a deliberate homelab compromise. For stronger isolation, generate the root on an air-gapped machine or hardware security module, and import only the intermediate.
 
